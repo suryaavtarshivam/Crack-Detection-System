@@ -1,0 +1,140 @@
+import os
+import sys
+import torch
+import pandas as pd
+import numpy as np
+from PIL import Image
+import tkinter as tk
+from tkinter import filedialog, messagebox
+import torchvision.transforms as transforms
+import torchvision.models as models
+import torch.nn as nn
+import torch.optim as optim
+from torch.utils.data import Dataset, DataLoader
+from sklearn.model_selection import train_test_split
+import multiprocessing
+
+class OptimizedCrackDataset(Dataset):
+    def __init__(self, image_paths, labels, transform=None, preload=False):
+        self.image_paths = image_paths
+        self.labels = labels
+        self.transform = transform
+        self.preload = preload
+        if preload:
+            self.images = [self._load_image(path) for path in image_paths]
+
+    def __len__(self):
+        return len(self.image_paths)
+
+    def __getitem__(self, idx):
+        if self.preload:
+            return self.images[idx], self.labels[idx]
+        return self._load_image(self.image_paths[idx]), self.labels[idx]
+
+    def _load_image(self, path):
+        img = Image.open(path).convert('RGB')
+        if self.transform:
+            img = self.transform(img)
+        return img
+
+class OptimizedCrackDetectionModel:
+    def __init__(self, num_classes=2):
+        self.model = models.efficientnet_b0(weights=models.EfficientNet_B0_Weights.DEFAULT)
+        num_features = self.model.classifier[1].in_features
+        self.model.classifier[1] = nn.Linear(num_features, num_classes)
+        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        self.model.to(self.device)
+
+    def train(self, train_loader, val_loader, epochs=10, learning_rate=0.001):
+        criterion = nn.CrossEntropyLoss()
+        optimizer = optim.AdamW(self.model.parameters(), lr=learning_rate, weight_decay=1e-5)
+        scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', patience=3, factor=0.5)
+        
+        for epoch in range(epochs):
+            self.model.train()
+            total_loss, correct, total = 0, 0, 0
+            for images, labels in train_loader:
+                images, labels = images.to(self.device), labels.to(self.device)
+                optimizer.zero_grad()
+                outputs = self.model(images)
+                loss = criterion(outputs, labels)
+                loss.backward()
+                optimizer.step()
+                total_loss += loss.item()
+                correct += (outputs.argmax(1) == labels).sum().item()
+                total += labels.size(0)
+            val_loss, val_acc = self.evaluate(val_loader, criterion)
+            scheduler.step(val_loss)
+            print(f"Epoch [{epoch+1}/{epochs}] - Train Loss: {total_loss/len(train_loader):.4f}, "
+                  f"Train Accuracy: {correct/total:.2f}, Val Loss: {val_loss:.4f}, Val Accuracy: {val_acc:.2f}")
+
+    def evaluate(self, loader, criterion):
+        self.model.eval()
+        total_loss, correct, total = 0, 0, 0
+        with torch.no_grad():
+            for images, labels in loader:
+                images, labels = images.to(self.device), labels.to(self.device)
+                outputs = self.model(images)
+                loss = criterion(outputs, labels)
+                total_loss += loss.item()
+                correct += (outputs.argmax(1) == labels).sum().item()
+                total += labels.size(0)
+        return total_loss / len(loader), correct / total
+
+    def predict(self, loader):
+        self.model.eval()
+        predictions = []
+        with torch.no_grad():
+            for images, _ in loader:
+                images = images.to(self.device)
+                outputs = self.model(images)
+                predictions.extend(outputs.argmax(1).cpu().numpy())
+        return predictions
+
+def select_folder(title):
+    return filedialog.askdirectory(title=title)
+
+def prepare_datasets(positive_folder, negative_folder, test_folder, preload=False):
+    transform = transforms.Compose([
+        transforms.Resize((128, 128)),  # Reduced resolution
+        transforms.ToTensor(),
+        transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
+    ])
+    
+    train_image_paths, train_labels = [], []
+    for folder, label in [(positive_folder, 1), (negative_folder, 0)]:
+        for file in os.listdir(folder):
+            if file.lower().endswith(('png', 'jpg', 'jpeg')):
+                train_image_paths.append(os.path.join(folder, file))
+                train_labels.append(label)
+
+    X_train, X_val, y_train, y_val = train_test_split(train_image_paths, train_labels, test_size=0.2, random_state=42)
+
+    test_image_paths = [os.path.join(test_folder, file) for file in os.listdir(test_folder) if file.lower().endswith(('png', 'jpg', 'jpeg'))]
+    test_labels = [0] * len(test_image_paths)
+
+    train_dataset = OptimizedCrackDataset(X_train, y_train, transform, preload)
+    val_dataset = OptimizedCrackDataset(X_val, y_val, transform, preload)
+    test_dataset = OptimizedCrackDataset(test_image_paths, test_labels, transform, preload)
+
+    num_workers = min(multiprocessing.cpu_count(), 8)
+    train_loader = DataLoader(train_dataset, batch_size=64, shuffle=True, num_workers=num_workers, pin_memory=True)
+    val_loader = DataLoader(val_dataset, batch_size=64, shuffle=False, num_workers=num_workers, pin_memory=True)
+    test_loader = DataLoader(test_dataset, batch_size=64, shuffle=False, num_workers=num_workers, pin_memory=True)
+
+    return train_loader, val_loader, test_loader
+
+def main():
+    root = tk.Tk()
+    root.withdraw()
+    positive_folder = select_folder("Select Positive Training Folder")
+    negative_folder = select_folder("Select Negative Training Folder")
+    test_folder = select_folder("Select Test Folder")
+    train_loader, val_loader, test_loader = prepare_datasets(positive_folder, negative_folder, test_folder)
+    model = OptimizedCrackDetectionModel()
+    model.train(train_loader, val_loader)
+    predictions = model.predict(test_loader)
+    print("Predictions:", predictions)
+
+if __name__ == "__main__":
+    main()
